@@ -11,8 +11,6 @@ class API {
     private $settings;
     private $logger;
     private $custom_fields_cache = null;
-    private $tags_cache = null;
-    private $tag_limit_reached = false; // Track if tag limit is reached
     
     public function __construct($settings, $logger) {
         $this->settings = $settings;
@@ -52,11 +50,6 @@ class API {
         if (empty($email)) {
             $this->logger->log('Error: Email is required but not found in customer data');
             return false;
-        }
-        
-        // Preload tags if using tags (do this before checking contact)
-        if ($this->should_use_tags() && !empty($additional_tags)) {
-            $this->load_tags();
         }
         
         // Check if contact already exists
@@ -137,27 +130,16 @@ class API {
                 $field_created = $this->ensure_custom_field_exists($custom_field_slug);
                 
                 if ($field_created) {
-                    // For new contacts or when custom field value should be replaced (not appended)
-                    $final_custom_field_value = $custom_field_value;
-                    
-                    // Only append to existing value if contact exists, has existing value, 
-                    // and the new value is different and from the same logical source
-                    if (!empty($existing_custom_field_value) && $contact_exists) {
+                    // Append to existing value if contact exists and has custom field value
+                    if (!empty($existing_custom_field_value)) {
                         // Check if the new value already exists in the list
                         $existing_values = array_map('trim', explode(',', $existing_custom_field_value));
                         if (!in_array($custom_field_value, $existing_values)) {
-                            // Only append if it's a logical addition (same type of data)
-                            if ($this->should_append_custom_field_value($source, $existing_custom_field_value, $custom_field_value)) {
-                                $final_custom_field_value = $existing_custom_field_value . ', ' . $custom_field_value;
-                                $this->logger->log("Info: Appending '{$custom_field_value}' to existing custom field value");
-                            } else {
-                                // Replace with new value if it's from a different source type
-                                $final_custom_field_value = $custom_field_value;
-                                $this->logger->log("Info: Replacing custom field value with '{$custom_field_value}' from {$source}");
-                            }
+                            $custom_field_value = $existing_custom_field_value . ', ' . $custom_field_value;
+                            $this->logger->log("Info: Appending '{$custom_field_value}' to existing custom field value");
                         } else {
                             // Value already exists, use the existing value
-                            $final_custom_field_value = $existing_custom_field_value;
+                            $custom_field_value = $existing_custom_field_value;
                             $this->logger->log("Info: Custom field value '{$custom_field_value}' already exists, not duplicating");
                         }
                     }
@@ -165,7 +147,7 @@ class API {
                     // Add custom field to contact data
                     $contact_data['fields'][] = array(
                         'slug' => $custom_field_slug,
-                        'value' => $final_custom_field_value
+                        'value' => $custom_field_value
                     );
                 } else {
                     $this->logger->log("Warning: Could not create custom field '{$custom_field_slug}', proceeding without it");
@@ -193,8 +175,8 @@ class API {
         if ($response['success']) {
             $this->logger->log("Success: Customer {$email} ({$firstName} {$lastName}) successfully synced from {$source}");
             
-            // Handle tags based on settings - only if not using custom field OR explicitly enabled
-            if ($this->should_use_tags() && !$this->tag_limit_reached) {
+            // Handle tags based on settings
+            if ($this->should_use_tags()) {
                 // Prepare all tags
                 $all_tags = array();
                 if (!empty($this->get_default_tags())) {
@@ -211,8 +193,6 @@ class API {
                     $contact_identifier = $contact_id ?: $email;
                     $this->add_tags_to_contact($contact_identifier, $all_tags, $contact_id !== null);
                 }
-            } elseif ($this->tag_limit_reached) {
-                $this->logger->log("Info: Skipping tags due to plan limitations - contact synced successfully without tags");
             }
             
             // Fire action for other plugins to hook into
@@ -246,239 +226,96 @@ class API {
     }
     
     /**
-     * Add tags to contact with error handling for plan limitations
+     * Add tags to contact
      */
     private function add_tags_to_contact($contact_identifier, $tags, $is_id = false) {
-        // Skip if tag limit already reached
-        if ($this->tag_limit_reached) {
-            return;
-        }
-        
-        // First, ensure all tags exist
-        $this->ensure_tags_exist($tags);
-        
-        // If tag limit was reached during tag creation, skip assignment
-        if ($this->tag_limit_reached) {
-            return;
-        }
-        
-        // Get contact ID if we have email
-        $contact_id = $contact_identifier;
-        if (!$is_id) {
-            $contact = $this->get_contact_by_email($contact_identifier);
-            if (!$contact || !isset($contact['data']['id'])) {
-                $this->logger->log("Error: Could not find contact to assign tags");
-                return;
-            }
-            $contact_id = $contact['data']['id'];
-        }
-        
-        // Get existing tags for the contact to avoid duplicates
-        $existing_tags = $this->get_contact_tags($contact_id);
-        
         foreach ($tags as $tag) {
             if (!empty($tag)) {
                 $tag = trim($tag);
                 
-                // Check if tag is already assigned
-                if (in_array($tag, $existing_tags)) {
-                    if ($this->is_debug_mode()) {
-                        $this->logger->log("Debug: Tag '{$tag}' already assigned to contact, skipping");
-                    }
-                    continue;
-                }
-                
-                // Get tag ID from cache
-                $tag_id = $this->get_tag_id_by_name($tag);
-                if (!$tag_id) {
-                    $this->logger->log("Warning: Could not find tag ID for '{$tag}'");
-                    continue;
-                }
-                
                 if ($this->is_debug_mode()) {
-                    $this->logger->log("Debug: Assigning tag '{$tag}' (ID: {$tag_id}) to contact ID: {$contact_id}");
+                    $this->logger->log("Debug: Adding tag '{$tag}' to contact {$contact_identifier}");
+                }
+                
+                // Create tag first (it's okay if it already exists)
+                $tag_response = $this->call_systeme_api('tags', array('name' => $tag));
+                if ($this->is_debug_mode()) {
+                    $this->logger->log("Debug: Create tag '{$tag}' response: " . json_encode($tag_response));
+                }
+                
+                // Get tag ID from response if available
+                $tag_id = null;
+                if (isset($tag_response['data']['id'])) {
+                    $tag_id = $tag_response['data']['id'];
                 }
                 
                 // Assign tag to contact
-                $tag_data = array(
-                    'tagId' => $tag_id
-                );
-                
-                $response = $this->call_systeme_api("contacts/{$contact_id}/tags", $tag_data);
-                
-                if ($response['success']) {
-                    $this->logger->log("Success: Tag '{$tag}' assigned to contact");
+                $assign_response = $this->assign_tag_to_contact($contact_identifier, $tag, $tag_id, $is_id);
+                if ($assign_response['success']) {
+                    $this->logger->log("Success: Tag '{$tag}' added to contact");
                 } else {
-                    // Check for tag limit error
-                    if ($this->is_tag_limit_error($response['message'])) {
-                        $this->tag_limit_reached = true;
-                        $this->logger->log("Warning: Tag limit reached on free plan. Continuing without additional tags.");
-                        break;
-                    } else {
-                        $this->logger->log("Warning: Failed to assign tag '{$tag}' to contact - {$response['message']}");
-                    }
+                    $this->logger->log("Warning: Failed to add tag '{$tag}' to contact - {$assign_response['message']}");
                 }
             }
         }
-    }
-    
-    /**
-     * Check if error message indicates tag limit reached
-     */
-    private function is_tag_limit_error($error_message) {
-        $error_lower = strtolower($error_message);
-        return strpos($error_lower, 'upgrade') !== false && 
-               (strpos($error_lower, 'tag') !== false || strpos($error_lower, 'plan') !== false);
-    }
-    
-    /**
-     * Ensure all tags exist with error handling for plan limitations
-     */
-    private function ensure_tags_exist($tags) {
-        // Skip if tag limit already reached
-        if ($this->tag_limit_reached) {
-            return;
-        }
-        
-        // Load existing tags
-        $this->load_tags();
-        
-        foreach ($tags as $tag) {
-            if (!empty($tag)) {
-                $tag = trim($tag);
-                
-                // Check if tag already exists in cache
-                if (!$this->tag_exists_in_cache($tag)) {
-                    // Create the tag
-                    $this->create_tag($tag);
-                    
-                    // If tag limit was reached during creation, stop
-                    if ($this->tag_limit_reached) {
-                        break;
-                    }
-                }
-            }
-        }
-    }
-    
-    /**
-     * Load tags from Systeme.io
-     */
-    private function load_tags() {
-        $this->tags_cache = array();
-        
-        if ($this->is_debug_mode()) {
-            $this->logger->log("Debug: Loading tags from Systeme.io");
-        }
-        
-        $response = $this->call_systeme_api_method('tags', null, 'GET');
-        
-        if ($response['success']) {
-            if (isset($response['data']['items'])) {
-                foreach ($response['data']['items'] as $tag) {
-                    if (isset($tag['name']) && isset($tag['id'])) {
-                        $this->tags_cache[$tag['name']] = $tag['id'];
-                    }
-                }
-            } elseif (isset($response['data']) && is_array($response['data'])) {
-                // Handle different response format
-                foreach ($response['data'] as $tag) {
-                    if (isset($tag['name']) && isset($tag['id'])) {
-                        $this->tags_cache[$tag['name']] = $tag['id'];
-                    }
-                }
-            }
-            
-            if ($this->is_debug_mode()) {
-                $this->logger->log("Debug: Loaded " . count($this->tags_cache) . " tags");
-            }
-        } else {
-            $this->logger->log("Warning: Failed to load tags - {$response['message']}");
-        }
-    }
-    
-    /**
-     * Check if tag exists in cache
-     */
-    private function tag_exists_in_cache($tag_name) {
-        return isset($this->tags_cache[$tag_name]);
-    }
-    
-    /**
-     * Get tag ID by name
-     */
-    private function get_tag_id_by_name($tag_name) {
-        return isset($this->tags_cache[$tag_name]) ? $this->tags_cache[$tag_name] : null;
-    }
-    
-    /**
-     * Create a tag with error handling for plan limitations
-     */
-    private function create_tag($tag_name) {
-        if ($this->is_debug_mode()) {
-            $this->logger->log("Debug: Creating tag '{$tag_name}'");
-        }
-        
-        $tag_data = array(
-            'name' => $tag_name
-        );
-        
-        $response = $this->call_systeme_api('tags', $tag_data);
-        
-        if ($response['success']) {
-            if (isset($response['data']['id'])) {
-                $this->tags_cache[$tag_name] = $response['data']['id'];
-                $this->logger->log("Success: Tag '{$tag_name}' created with ID: " . $response['data']['id']);
-            }
-        } else {
-            // Check for tag limit error
-            if ($this->is_tag_limit_error($response['message'])) {
-                $this->tag_limit_reached = true;
-                $this->logger->log("Warning: Tag limit reached on free plan. Consider upgrading or using custom fields instead.");
-                return;
-            }
-            
-            // Check if tag already exists
-            if (strpos($response['message'], 'already') !== false || 
-                strpos($response['message'], 'duplicate') !== false ||
-                strpos($response['message'], 'taken') !== false) {
-                // Tag exists, try to get its ID
-                $this->load_tags();
-                if ($this->is_debug_mode()) {
-                    $this->logger->log("Debug: Tag '{$tag_name}' already exists, reloaded tags");
-                }
-            } else {
-                $this->logger->log("Error: Failed to create tag '{$tag_name}' - {$response['message']}");
-            }
-        }
-    }
-    
-    /**
-     * Get contact tags
-     */
-    private function get_contact_tags($contact_id) {
-        $tags = array();
-        
-        // Get contact details to see current tags
-        $response = $this->call_systeme_api_method("contacts/{$contact_id}", null, 'GET');
-        
-        if ($response['success'] && isset($response['data']['tags'])) {
-            foreach ($response['data']['tags'] as $tag) {
-                if (isset($tag['name'])) {
-                    $tags[] = $tag['name'];
-                }
-            }
-        }
-        
-        return $tags;
     }
     
     /**
      * Assign tag to contact using various methods
      */
     private function assign_tag_to_contact($contact_identifier, $tag_name, $tag_id = null, $is_id = false) {
-        // This method is now deprecated, use add_tags_to_contact instead
-        $this->add_tags_to_contact($contact_identifier, array($tag_name), $is_id);
+        // If we have contact ID and tag ID, use the direct method
+        if ($is_id && $tag_id) {
+            $tag_data = array(
+                'tagId' => $tag_id
+            );
+            
+            $response = $this->call_systeme_api("contacts/{$contact_identifier}/tags", $tag_data);
+            if ($response['success']) {
+                return $response;
+            }
+        }
+        
+        // If contact_identifier is an email, get contact ID first
+        if (!$is_id) {
+            $contact = $this->get_contact_by_email($contact_identifier);
+            if ($contact && isset($contact['data']['id'])) {
+                $contact_id = $contact['data']['id'];
+                
+                if ($tag_id) {
+                    $tag_data = array(
+                        'tagId' => $tag_id
+                    );
+                    
+                    $response = $this->call_systeme_api("contacts/{$contact_id}/tags", $tag_data);
+                    if ($response['success']) {
+                        return $response;
+                    }
+                }
+            }
+        }
+        
+        // Fallback: try different methods
+        // Method 1: Try with tag name
+        $tag_data = array(
+            'name' => $tag_name
+        );
+        
+        $response = $this->call_systeme_api("contacts/{$contact_identifier}/tags", $tag_data);
+        if ($response['success']) {
+            return $response;
+        }
+        
+        // Method 2: Try updating contact with tags array
+        $contact_update_data = array(
+            'email' => $is_id ? null : $contact_identifier,
+            'tags' => array($tag_name)
+        );
+        
+        $endpoint = $is_id ? "contacts/{$contact_identifier}" : "contacts";
+        $method = $is_id ? 'PUT' : 'POST';
+        
+        return $this->call_systeme_api_method($endpoint, $contact_update_data, $method);
     }
     
     /**
@@ -528,57 +365,8 @@ class API {
     }
     
     /**
-     * Check if should append custom field value or replace it
+     * Check if should use custom field instead of tags
      */
-    private function should_append_custom_field_value($current_source, $existing_value, $new_value) {
-        // Always append for booking-related sources (Amelia, Bookly, etc.) and form sources
-        $booking_sources = array('amelia_appointment', 'amelia_event', 'bookly', 'easy_appointments', 'wc_bookings', 'woocommerce');
-        $form_sources = array('contact_form_7', 'gravity_forms');
-        $user_sources = array('user_registration');
-        
-        // If current source is booking/form related, always append
-        if (in_array($current_source, $booking_sources) || in_array($current_source, $form_sources)) {
-            if ($this->is_debug_mode()) {
-                $this->logger->log("Debug: Source '{$current_source}' is booking/form related, will append");
-            }
-            return true;
-        }
-        
-        // Only replace if existing value is from user registration and new value is from booking/form
-        if (in_array($current_source, $booking_sources) || in_array($current_source, $form_sources)) {
-            // Check if existing value contains user registration keywords
-            $user_keywords = array('WordPress User', 'User Registration', 'New User');
-            foreach ($user_keywords as $keyword) {
-                if (stripos($existing_value, $keyword) !== false) {
-                    if ($this->is_debug_mode()) {
-                        $this->logger->log("Debug: Existing value contains user registration keyword '{$keyword}', will replace with booking/form data");
-                    }
-                    return false; // Replace, don't append
-                }
-            }
-        }
-        
-        return true; // Default to append
-    }
-    
-    /**
-     * Get keywords that identify specific integrations
-     */
-    private function get_integration_keywords($integration_type) {
-        $keywords = array(
-            'contact_form_7' => array('Contact form', 'CF7', 'Form'),
-            'gravity_forms' => array('Gravity', 'GF'),
-            'user_registration' => array('WordPress User', 'User Registration', 'New User'),
-            'woocommerce' => array('WooCommerce', 'Product', 'Order'),
-            'amelia_appointment' => array('Amelia', 'Appointment', 'Service'),
-            'amelia_event' => array('Amelia', 'Event'),
-            'bookly' => array('Bookly'),
-            'easy_appointments' => array('Easy Appointments'),
-            'wc_bookings' => array('Booking', 'WooCommerce Booking')
-        );
-        
-        return isset($keywords[$integration_type]) ? $keywords[$integration_type] : array();
-    }
     private function should_use_custom_field() {
         return isset($this->settings['use_custom_field']) && $this->settings['use_custom_field'];
     }
@@ -605,28 +393,19 @@ class API {
         // Check if there's a custom mapping for this source
         $custom_mappings = $this->get_custom_field_mappings();
         
-        if (isset($custom_mappings[$source]) && !empty($custom_mappings[$source])) {
-            // Process placeholders in the mapping
-            $value = $custom_mappings[$source];
-            
-            // Replace placeholders with actual values
-            $value = $this->replace_placeholders($value, $customer_data, $source);
-            
-            return $value;
+        if (isset($custom_mappings[$source])) {
+            return $custom_mappings[$source];
         }
         
-        // Check for product/event/service information in customer data
-        if (isset($customer_data['product']) && !empty($customer_data['product'])) {
+        // Check for product/event information in customer data
+        if (isset($customer_data['product'])) {
             return $customer_data['product'];
         }
-        if (isset($customer_data['event']) && !empty($customer_data['event'])) {
+        if (isset($customer_data['event'])) {
             return $customer_data['event'];
         }
-        if (isset($customer_data['service']) && !empty($customer_data['service'])) {
+        if (isset($customer_data['service'])) {
             return $customer_data['service'];
-        }
-        if (isset($customer_data['form_title']) && !empty($customer_data['form_title'])) {
-            return $customer_data['form_title'];
         }
         
         // Use first additional tag if available
@@ -636,35 +415,6 @@ class API {
         
         // Default to source name
         return ucfirst(str_replace('_', ' ', $source));
-    }
-    
-    /**
-     * Replace placeholders in custom field mapping
-     */
-    private function replace_placeholders($value, $customer_data, $source) {
-        // Available placeholders
-        $placeholders = array(
-            '{service_name}' => isset($customer_data['service']) ? $customer_data['service'] : '',
-            '{event_name}' => isset($customer_data['event']) ? $customer_data['event'] : '',
-            '{product_name}' => isset($customer_data['product']) ? $customer_data['product'] : '',
-            '{form_title}' => isset($customer_data['form_title']) ? $customer_data['form_title'] : '',
-            '{form_name}' => isset($customer_data['form_name']) ? $customer_data['form_name'] : '',
-            '{source}' => ucfirst(str_replace('_', ' ', $source)),
-            '{date}' => date('Y-m-d'),
-            '{datetime}' => date('Y-m-d H:i'),
-            '{customer_name}' => trim((isset($customer_data['firstName']) ? $customer_data['firstName'] : '') . ' ' . (isset($customer_data['lastName']) ? $customer_data['lastName'] : '')),
-            '{email}' => isset($customer_data['email']) ? $customer_data['email'] : ''
-        );
-        
-        // Replace all placeholders
-        foreach ($placeholders as $placeholder => $replacement) {
-            $value = str_replace($placeholder, $replacement, $value);
-        }
-        
-        // Remove any unreplaced placeholders
-        $value = preg_replace('/\{[^}]+\}/', '', $value);
-        
-        return trim($value);
     }
     
     /**

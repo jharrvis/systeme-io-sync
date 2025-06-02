@@ -45,9 +45,9 @@ class Integrations {
             add_action('gform_after_submission', array($this, 'sync_gravity_forms_customer'), 10, 2);
         }
         
-        // User registration hooks
+        // User registration hooks - use lower priority to run after booking processes
         if ($this->core->is_plugin_sync_enabled('user_registration')) {
-            add_action('user_register', array($this, 'sync_new_user'), 10, 1);
+            add_action('user_register', array($this, 'sync_new_user'), 999, 1); // Very low priority
         }
     }
     
@@ -60,6 +60,11 @@ class Integrations {
             add_action('amelia_after_booking_added', array($this, 'sync_amelia_customer'), 10, 1);
             add_action('amelia_after_appointment_booking_saved', array($this, 'sync_amelia_customer_saved'), 10, 2);
             add_action('amelia_after_event_booking_saved', array($this, 'sync_amelia_event_customer'), 10, 2);
+            
+            // Additional Amelia hooks for better event detection
+            add_action('amelia_booking_confirmed', array($this, 'sync_amelia_booking_confirmed'), 10, 1);
+            add_action('amelia_event_booking_added', array($this, 'sync_amelia_event_booking_added'), 10, 1);
+            add_action('ameliabooking_event_booking_saved', array($this, 'sync_amelia_event_customer'), 10, 2);
         }
         
         // Bookly hooks
@@ -133,9 +138,21 @@ class Integrations {
     public function sync_amelia_customer_saved($booking, $reservation) {
         if (!$this->core->is_plugin_sync_enabled('amelia')) return;
         
+        if ($this->core->is_debug_mode()) {
+            $this->core->get_logger()->log("Debug: Amelia appointment booking data: " . json_encode($booking));
+            $this->core->get_logger()->log("Debug: Amelia appointment reservation data: " . json_encode($reservation));
+        }
+        
         if (isset($booking['customer'])) {
+            // Try to get service info from reservation or booking
+            $service_data = $this->get_amelia_service_from_reservation($reservation, $booking);
+            
+            if ($this->core->is_debug_mode()) {
+                $this->core->get_logger()->log("Debug: Extracted service data: " . json_encode($service_data));
+            }
+            
             // Pass booking data which may contain service info
-            $customer_data = $this->prepare_amelia_customer_data($booking['customer'], $booking);
+            $customer_data = $this->prepare_amelia_customer_data($booking['customer'], $service_data);
             $this->core->sync_customer_universal($customer_data, 'amelia_appointment', array('Amelia Customer'));
         }
     }
@@ -146,11 +163,405 @@ class Integrations {
     public function sync_amelia_event_customer($booking, $reservation) {
         if (!$this->core->is_plugin_sync_enabled('amelia')) return;
         
+        if ($this->core->is_debug_mode()) {
+            $this->core->get_logger()->log("Debug: Amelia event booking data: " . json_encode($booking));
+            $this->core->get_logger()->log("Debug: Amelia event reservation data: " . json_encode($reservation));
+        }
+        
         if (isset($booking['customer'])) {
+            // Try to get event info from reservation or booking
+            $event_data = $this->get_amelia_event_from_reservation($reservation, $booking);
+            
+            if ($this->core->is_debug_mode()) {
+                $this->core->get_logger()->log("Debug: Extracted event data: " . json_encode($event_data));
+            }
+            
             // Pass booking data which may contain event info
-            $customer_data = $this->prepare_amelia_customer_data($booking['customer'], $booking);
+            $customer_data = $this->prepare_amelia_customer_data($booking['customer'], $event_data);
             $this->core->sync_customer_universal($customer_data, 'amelia_event', array('Amelia Event'));
         }
+    }
+    
+    /**
+     * Sync Amelia booking confirmed
+     */
+    public function sync_amelia_booking_confirmed($booking_data) {
+        if (!$this->core->is_plugin_sync_enabled('amelia')) return;
+        
+        if ($this->core->is_debug_mode()) {
+            $this->core->get_logger()->log("Debug: Amelia booking confirmed: " . json_encode($booking_data));
+        }
+        
+        // Determine if it's an event or appointment
+        if (isset($booking_data['eventId']) || isset($booking_data['event_id']) || isset($booking_data['event'])) {
+            // It's an event booking
+            if (isset($booking_data['customer'])) {
+                $event_data = $this->extract_amelia_event_data($booking_data);
+                $customer_data = $this->prepare_amelia_customer_data($booking_data['customer'], $event_data);
+                $this->core->sync_customer_universal($customer_data, 'amelia_event', array('Amelia Event'));
+            }
+        } else {
+            // It's an appointment booking
+            if (isset($booking_data['customer'])) {
+                $service_data = $this->extract_amelia_service_data($booking_data);
+                $customer_data = $this->prepare_amelia_customer_data($booking_data['customer'], $service_data);
+                $this->core->sync_customer_universal($customer_data, 'amelia_appointment', array('Amelia Customer'));
+            }
+        }
+    }
+    
+    /**
+     * Sync Amelia event booking added
+     */
+    public function sync_amelia_event_booking_added($booking_data) {
+        if (!$this->core->is_plugin_sync_enabled('amelia')) return;
+        
+        if ($this->core->is_debug_mode()) {
+            $this->core->get_logger()->log("Debug: Amelia event booking added: " . json_encode($booking_data));
+        }
+        
+        if (isset($booking_data['customer'])) {
+            $event_data = $this->extract_amelia_event_data($booking_data);
+            $customer_data = $this->prepare_amelia_customer_data($booking_data['customer'], $event_data);
+            $this->core->sync_customer_universal($customer_data, 'amelia_event', array('Amelia Event'));
+        }
+    }
+    
+    /**
+     * Extract Amelia event data from booking
+     */
+    private function extract_amelia_event_data($booking_data) {
+        $event_data = array();
+        
+        // Try to get event from direct data
+        if (isset($booking_data['event']) && isset($booking_data['event']['name'])) {
+            $event_data = array('event' => $booking_data['event']);
+        } elseif (isset($booking_data['eventName'])) {
+            $event_data = array('event' => array('name' => $booking_data['eventName']));
+        } elseif (isset($booking_data['event_name'])) {
+            $event_data = array('event' => array('name' => $booking_data['event_name']));
+        }
+        
+        // If not found, try to get by ID
+        if (empty($event_data)) {
+            $event_id = null;
+            if (isset($booking_data['eventId'])) {
+                $event_id = $booking_data['eventId'];
+            } elseif (isset($booking_data['event_id'])) {
+                $event_id = $booking_data['event_id'];
+            }
+            
+            if ($event_id) {
+                $event_data = $this->get_amelia_event_by_id($event_id);
+            }
+        }
+        
+        return $event_data;
+    }
+    
+    /**
+     * Extract Amelia service data from booking
+     */
+    private function extract_amelia_service_data($booking_data) {
+        $service_data = array();
+        
+        // Try to get service from direct data
+        if (isset($booking_data['service']) && isset($booking_data['service']['name'])) {
+            $service_data = array('service' => $booking_data['service']);
+        } elseif (isset($booking_data['serviceName'])) {
+            $service_data = array('service' => array('name' => $booking_data['serviceName']));
+        } elseif (isset($booking_data['service_name'])) {
+            $service_data = array('service' => array('name' => $booking_data['service_name']));
+        }
+        
+        // If not found, try to get by ID
+        if (empty($service_data)) {
+            $service_id = null;
+            if (isset($booking_data['serviceId'])) {
+                $service_id = $booking_data['serviceId'];
+            } elseif (isset($booking_data['service_id'])) {
+                $service_id = $booking_data['service_id'];
+            }
+            
+            if ($service_id) {
+                $service_data = $this->get_amelia_service_by_id($service_id);
+            }
+        }
+        
+        return $service_data;
+    }
+    
+    /**
+     * Get Amelia service from reservation data
+     */
+    private function get_amelia_service_from_reservation($reservation, $booking) {
+        $service_data = array();
+        
+        if ($this->core->is_debug_mode()) {
+            $this->core->get_logger()->log("Debug: Looking for service in reservation: " . json_encode($reservation));
+            $this->core->get_logger()->log("Debug: Looking for service in booking: " . json_encode($booking));
+        }
+        
+        // First try to get service from direct data in reservation or booking
+        if (isset($reservation['service']) && isset($reservation['service']['name'])) {
+            $service_data = array('service' => $reservation['service']);
+            if ($this->core->is_debug_mode()) {
+                $this->core->get_logger()->log("Debug: Found service in reservation direct: " . $reservation['service']['name']);
+            }
+        } elseif (isset($booking['service']) && isset($booking['service']['name'])) {
+            $service_data = array('service' => $booking['service']);
+            if ($this->core->is_debug_mode()) {
+                $this->core->get_logger()->log("Debug: Found service in booking direct: " . $booking['service']['name']);
+            }
+        }
+        
+        // If not found, try to get service ID and lookup from database
+        if (empty($service_data)) {
+            $service_id = null;
+            
+            // Try to get service ID from various places
+            if (isset($reservation['serviceId'])) {
+                $service_id = $reservation['serviceId'];
+            } elseif (isset($booking['serviceId'])) {
+                $service_id = $booking['serviceId'];
+            } elseif (isset($reservation['service_id'])) {
+                $service_id = $reservation['service_id'];
+            } elseif (isset($booking['service_id'])) {
+                $service_id = $booking['service_id'];
+            }
+            
+            if ($service_id) {
+                if ($this->core->is_debug_mode()) {
+                    $this->core->get_logger()->log("Debug: Found service ID: {$service_id}, looking up in database");
+                }
+                $service_data = $this->get_amelia_service_by_id($service_id);
+            }
+        }
+        
+        // If still empty, try to find service name in any text fields
+        if (empty($service_data)) {
+            // Look for service name in various possible fields
+            $possible_service_fields = array('serviceName', 'service_name', 'name');
+            
+            foreach (array($reservation, $booking) as $data_source) {
+                if (is_array($data_source)) {
+                    foreach ($possible_service_fields as $field) {
+                        if (isset($data_source[$field]) && !empty($data_source[$field])) {
+                            $service_data = array('service' => array('name' => $data_source[$field]));
+                            if ($this->core->is_debug_mode()) {
+                                $this->core->get_logger()->log("Debug: Found service name in {$field}: " . $data_source[$field]);
+                            }
+                            break 2;
+                        }
+                    }
+                }
+            }
+        }
+        
+        if ($this->core->is_debug_mode()) {
+            $this->core->get_logger()->log("Debug: Final service data: " . json_encode($service_data));
+        }
+        
+        return $service_data;
+    }
+    
+    /**
+     * Get Amelia event from reservation data
+     */
+    private function get_amelia_event_from_reservation($reservation, $booking) {
+        $event_data = array();
+        
+        if ($this->core->is_debug_mode()) {
+            $this->core->get_logger()->log("Debug: Looking for event in reservation: " . json_encode($reservation));
+            $this->core->get_logger()->log("Debug: Looking for event in booking: " . json_encode($booking));
+        }
+        
+        // First try to get event from direct data in reservation or booking
+        if (isset($reservation['event']) && isset($reservation['event']['name'])) {
+            $event_data = array('event' => $reservation['event']);
+            if ($this->core->is_debug_mode()) {
+                $this->core->get_logger()->log("Debug: Found event in reservation direct: " . $reservation['event']['name']);
+            }
+        } elseif (isset($booking['event']) && isset($booking['event']['name'])) {
+            $event_data = array('event' => $booking['event']);
+            if ($this->core->is_debug_mode()) {
+                $this->core->get_logger()->log("Debug: Found event in booking direct: " . $booking['event']['name']);
+            }
+        }
+        
+        // If not found, try to get event ID and lookup from database
+        if (empty($event_data)) {
+            $event_id = null;
+            
+            // Try to get event ID from various places
+            if (isset($reservation['eventId'])) {
+                $event_id = $reservation['eventId'];
+            } elseif (isset($booking['eventId'])) {
+                $event_id = $booking['eventId'];
+            } elseif (isset($reservation['event_id'])) {
+                $event_id = $reservation['event_id'];
+            } elseif (isset($booking['event_id'])) {
+                $event_id = $booking['event_id'];
+            }
+            
+            if ($event_id) {
+                if ($this->core->is_debug_mode()) {
+                    $this->core->get_logger()->log("Debug: Found event ID: {$event_id}, looking up in database");
+                }
+                $event_data = $this->get_amelia_event_by_id($event_id);
+            }
+        }
+        
+        // If still empty, try to find event name in any text fields
+        if (empty($event_data)) {
+            // Look for event name in various possible fields
+            $possible_event_fields = array('eventName', 'event_name', 'name');
+            
+            foreach (array($reservation, $booking) as $data_source) {
+                if (is_array($data_source)) {
+                    foreach ($possible_event_fields as $field) {
+                        if (isset($data_source[$field]) && !empty($data_source[$field])) {
+                            $event_data = array('event' => array('name' => $data_source[$field]));
+                            if ($this->core->is_debug_mode()) {
+                                $this->core->get_logger()->log("Debug: Found event name in {$field}: " . $data_source[$field]);
+                            }
+                            break 2;
+                        }
+                    }
+                }
+            }
+        }
+        
+        if ($this->core->is_debug_mode()) {
+            $this->core->get_logger()->log("Debug: Final event data: " . json_encode($event_data));
+        }
+        
+        return $event_data;
+    }
+    
+    /**
+     * Get Amelia service by ID from database
+     */
+    private function get_amelia_service_by_id($service_id) {
+        global $wpdb;
+        
+        try {
+            // Try multiple possible table names for Amelia services
+            $possible_tables = array(
+                $wpdb->prefix . 'amelia_services',
+                $wpdb->prefix . 'amelia_service',
+                $wpdb->prefix . 'ameliabooking_services',
+                $wpdb->prefix . 'ameliabooking_service'
+            );
+            
+            foreach ($possible_tables as $table_name) {
+                // Check if table exists
+                if ($wpdb->get_var("SHOW TABLES LIKE '$table_name'") == $table_name) {
+                    if ($this->core->is_debug_mode()) {
+                        $this->core->get_logger()->log("Debug: Found Amelia services table: {$table_name}");
+                    }
+                    
+                    $service = $wpdb->get_row($wpdb->prepare(
+                        "SELECT * FROM $table_name WHERE id = %d",
+                        $service_id
+                    ), ARRAY_A);
+                    
+                    if ($service) {
+                        if ($this->core->is_debug_mode()) {
+                            $this->core->get_logger()->log("Debug: Found service in database: " . json_encode($service));
+                        }
+                        
+                        // Try different possible name columns
+                        $service_name = null;
+                        if (isset($service['name'])) {
+                            $service_name = $service['name'];
+                        } elseif (isset($service['title'])) {
+                            $service_name = $service['title'];
+                        } elseif (isset($service['service_name'])) {
+                            $service_name = $service['service_name'];
+                        }
+                        
+                        if ($service_name) {
+                            return array('service' => array('name' => $service_name));
+                        }
+                    }
+                }
+            }
+            
+            if ($this->core->is_debug_mode()) {
+                $this->core->get_logger()->log("Debug: No Amelia services table found or service not found with ID: {$service_id}");
+            }
+            
+        } catch (Exception $e) {
+            if ($this->core->is_debug_mode()) {
+                $this->core->get_logger()->log("Debug: Error getting Amelia service: " . $e->getMessage());
+            }
+        }
+        
+        return array();
+    }
+    
+    /**
+     * Get Amelia event by ID from database
+     */
+    private function get_amelia_event_by_id($event_id) {
+        global $wpdb;
+        
+        try {
+            // Try multiple possible table names for Amelia events
+            $possible_tables = array(
+                $wpdb->prefix . 'amelia_events',
+                $wpdb->prefix . 'amelia_event',
+                $wpdb->prefix . 'ameliabooking_events',
+                $wpdb->prefix . 'ameliabooking_event'
+            );
+            
+            foreach ($possible_tables as $table_name) {
+                // Check if table exists
+                if ($wpdb->get_var("SHOW TABLES LIKE '$table_name'") == $table_name) {
+                    if ($this->core->is_debug_mode()) {
+                        $this->core->get_logger()->log("Debug: Found Amelia events table: {$table_name}");
+                    }
+                    
+                    // Try different possible column names
+                    $event = $wpdb->get_row($wpdb->prepare(
+                        "SELECT * FROM $table_name WHERE id = %d",
+                        $event_id
+                    ), ARRAY_A);
+                    
+                    if ($event) {
+                        if ($this->core->is_debug_mode()) {
+                            $this->core->get_logger()->log("Debug: Found event in database: " . json_encode($event));
+                        }
+                        
+                        // Try different possible name columns
+                        $event_name = null;
+                        if (isset($event['name'])) {
+                            $event_name = $event['name'];
+                        } elseif (isset($event['title'])) {
+                            $event_name = $event['title'];
+                        } elseif (isset($event['event_name'])) {
+                            $event_name = $event['event_name'];
+                        }
+                        
+                        if ($event_name) {
+                            return array('event' => array('name' => $event_name));
+                        }
+                    }
+                }
+            }
+            
+            if ($this->core->is_debug_mode()) {
+                $this->core->get_logger()->log("Debug: No Amelia events table found or event not found with ID: {$event_id}");
+            }
+            
+        } catch (Exception $e) {
+            if ($this->core->is_debug_mode()) {
+                $this->core->get_logger()->log("Debug: Error getting Amelia event: " . $e->getMessage());
+            }
+        }
+        
+        return array();
     }
     
     /**
@@ -182,6 +593,11 @@ class Integrations {
         }
         if (isset($booking_data['event']) && isset($booking_data['event']['name'])) {
             $data['event'] = $booking_data['event']['name'];  
+        }
+        
+        // Debug log the prepared data
+        if ($this->core->is_debug_mode()) {
+            $this->core->get_logger()->log("Debug: Prepared Amelia customer data: " . json_encode($data));
         }
         
         return $data;
@@ -354,6 +770,15 @@ class Integrations {
         $user = get_userdata($user_id);
         if (!$user) return;
         
+        // Check if this user registration is triggered by other plugins (Amelia, etc.)
+        // Skip if it's part of another booking process
+        if ($this->is_user_registration_from_booking($user_id)) {
+            if ($this->core->is_debug_mode()) {
+                $this->core->get_logger()->log("Debug: Skipping user registration sync for user {$user_id} as it's part of booking process");
+            }
+            return;
+        }
+        
         $customer_data = array(
             'email' => $user->user_email,
             'firstName' => $user->first_name ?: $user->display_name,
@@ -376,6 +801,46 @@ class Integrations {
         }
         
         $this->core->sync_customer_universal($customer_data, 'user_registration', array('WordPress User'));
+    }
+    
+    /**
+     * Check if user registration is from booking process
+     */
+    private function is_user_registration_from_booking($user_id) {
+        // Check if we're in the middle of Amelia booking process
+        if (did_action('amelia_after_booking_added') || 
+            did_action('amelia_after_appointment_booking_saved') || 
+            did_action('amelia_after_event_booking_saved')) {
+            return true;
+        }
+        
+        // Check if we're in WooCommerce checkout process
+        if (did_action('woocommerce_checkout_order_processed') || 
+            did_action('woocommerce_new_order')) {
+            return true;
+        }
+        
+        // Check recent user meta to see if this is part of booking
+        $user_registered_time = get_userdata($user_id)->user_registered;
+        $current_time = current_time('mysql');
+        $time_diff = strtotime($current_time) - strtotime($user_registered_time);
+        
+        // If user was registered within last 30 seconds, it might be part of booking
+        if ($time_diff < 30) {
+            // Check if there are any booking-related actions in progress
+            global $wp_filter;
+            $booking_actions = array('amelia_', 'bookly_', 'woocommerce_');
+            
+            foreach ($booking_actions as $action_prefix) {
+                foreach ($wp_filter as $action_name => $callbacks) {
+                    if (strpos($action_name, $action_prefix) === 0) {
+                        return true;
+                    }
+                }
+            }
+        }
+        
+        return false;
     }
     
     /**
