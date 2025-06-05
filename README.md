@@ -232,8 +232,8 @@ This plugin uses the following Systeme.io API endpoints:
 
 4. **Best Practices**:
    - Use descriptive custom field names
-   - Be consistent in mapping naming
-   - Regular check logs for monitoring
+   - Be consistent in mapping names
+   - Regularly check logs for monitoring
    - Consider the comma-separated format when setting up automations
 
 ## Changelog
